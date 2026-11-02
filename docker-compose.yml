@@ -1,0 +1,88 @@
+# 22earn on your own server (VPS): PostgreSQL + app + automatic HTTPS + reminders + daily backups.
+#   1. point your domain's DNS (A record) to the server
+#   2. cp .env.example .env  → fill DOMAIN, APP_URL=https://DOMAIN, POSTGRES_PASSWORD, keys…
+#   3. docker compose up -d --build
+name: 22earn
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: earn
+      POSTGRES_DB: earn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U earn -d earn"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://earn:${POSTGRES_PASSWORD}@db:5432/earn
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env (e.g. earn.example.com)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+  # "Pushed to post often": checks every 15 min, sends at the reminder hours you configure.
+  cron:
+    image: alpine:3.20
+    restart: unless-stopped
+    environment:
+      CRON_SECRET: ${CRON_SECRET:?Set CRON_SECRET in .env}
+    command: >
+      sh -c 'apk add --no-cache curl >/dev/null &&
+             while true; do
+               curl -fsS -m 60 -H "Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/reminders || true;
+               echo; sleep 900;
+             done'
+    depends_on:
+      - app
+
+  # Daily database backup (money data!) kept 14 days in ./backups
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    command: >
+      sh -c 'while true; do
+               pg_dump -h db -U earn -d earn -Fc -f /backups/earn-$$(date +%F).dump &&
+               find /backups -name "earn-*.dump" -mtime +14 -delete;
+               sleep 86400;
+             done'
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
